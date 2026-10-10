@@ -21,14 +21,27 @@ The popup reports **ratio** and **retention** side by side, because a single
   conversation turn opens (the transcript is re-expressed for the new turn) and
   whenever history inside the context is rewritten mid-loop.
 
-Per request the table shows the fresh input, the **cache write** and the **cache
-read** separately, so you can see which side is being billed:
+Per request the table shows fresh input, **cache write**, **cache read** and
+**output** with a progress bar for **both** ratio and retention, so you can see
+which side is being billed. Requests are grouped by turn (`›` opens a turn,
+`·` is inside a tool loop), and each turn header carries both bars too:
 
 ```
-     #  where        fresh   write    read   ratio  retention
-     1  turn open    11.6k       0     512    4.2% ░░░░░░░░░░   0.0%
-     2  loop         10.4k       0    12.7k   55.0% ██████████  99.9%
-    35  turn open    10.6k       0    10.2k   49.2% █░░░░░░░░░  10.9%
+/cache           → numbers (global + last 12 turns, all with bars)
+/cache-why       → what ratio vs retention means, with your session numbers
+
+cache · 35 req · 55.0% · 99.9% · stable
+Global
+  ratio  ███████████░░░░░░░░░ 55.0%
+  reten  ████████████████████ 99.9%
+  in 12.7k · wr 0 · rd 45.2k · out 8.1k · sv ~40k
+  stable — The prefix is stable …
+  worst #12 10.9% ret · 49.2% ratio
+Turns · requests
+      #  fresh  write   read    out  ratio             reten
+  =  T1  22.1k      0  23.2k    259  55.0% ██████░░░░  99.9% ██████████ · 2 req
+  >   1   11.6k      0    512    900   4.2% ░░░░░░░░░░   0.0% ░░░░░░░░░░
+  ·   2   10.4k      0   12.7k   1.1k 55.0% ██████░░░░  99.9% ██████████
 ```
 
 Line 2 is the case a ratio-only display gets wrong: 55 % looks like a broken
@@ -37,11 +50,22 @@ the 10.4k fresh tokens are the tool result that just arrived.
 
 ## Features
 
-- **Per-request** cache write / read / ratio / retention with bars
+- **Per-request** fresh / write / read / out + bars for both ratio and retention
+- **Per-turn** headers with both bars + token totals
 - **Session totals**: fresh input, cache write, cache read, output, saved
-- **Diagnosis** that separates new content from a rewritten prefix, and names the
-  requests that rewrote it with what they cost
-- **Sidebar widget**: `cache · 96.9% ratio · 99.9% retention · last 98.4%`
+- **Diagnosis** in 1–2 lines with a state (`stable` / `watch` / `rewritten` /
+  `cold`) + the worst offender, instead of a wall of text
+- **`/cache-why`** explains ratio vs retention with your live session numbers
+- **Sidebar widget** (one metric per line, fixed columns):
+  ```
+  cache · stable
+  session · 35 req
+    ratio ██████░░░░  55.0%
+    reten ██████████  99.9%
+  last #35
+    ratio ██████████  98.4%
+    reten ██████████  99.9%
+  ```
 
 ## Install
 

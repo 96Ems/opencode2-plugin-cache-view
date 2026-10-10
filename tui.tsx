@@ -15,13 +15,14 @@ import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import {
+  bar,
   computeMetrics,
   diagnose,
   fmtPercent,
   fmtTokens,
-  ratioBar,
   tone,
   type AnyRec,
+  type ReqMetrics,
   type SessionMetrics,
 } from "./metrics.ts";
 
@@ -104,7 +105,7 @@ export default Plugin.define({
     function Dialog(props: { title: string; children: any; footer?: string }) {
       let off: (() => void) | undefined;
       onMount(() => {
-        ctx.ui.dialog.set({ size: "xlarge" });
+        ctx.ui.dialog.set({ size: "xlarge", centered: true });
         off = ctx.keymap.layer(() => ({
           mode: "modal",
           commands: [
@@ -122,16 +123,67 @@ export default Plugin.define({
       );
     }
 
-    /** one request line: fresh / write / read / ratio / retention */
-    function row(m: SessionMetrics["list"][number]) {
-      const where = m.opensTurn ? "turn open" : "loop";
+    function stateOf(m: SessionMetrics): { label: string; kind: "ok" | "warn" | "err" | "muted" } {
+      if (m.list.length < 2) return { label: "cold", kind: "muted" };
+      if (m.meanRetention >= 0.9) return { label: "stable", kind: "ok" };
+      if (m.meanRetention >= 0.5) return { label: "watch", kind: "warn" };
+      return { label: "rewritten", kind: "err" };
+    }
+
+    /** group requests into turns: a new turn starts when opensTurn is true (after the first) */
+    function groupTurns(list: ReqMetrics[]): ReqMetrics[][] {
+      const turns: ReqMetrics[][] = [];
+      for (const r of list) {
+        const last = turns[turns.length - 1];
+        if (!last || r.opensTurn) turns.push([r]);
+        else last.push(r);
+      }
+      return turns;
+    }
+
+    function turnAgg(rows: ReqMetrics[]): { ratio: number; retention: number; fresh: number; read: number; write: number; output: number } {
+      const fresh = rows.reduce((a, r) => a + r.input, 0);
+      const read = rows.reduce((a, r) => a + r.cacheRead, 0);
+      const write = rows.reduce((a, r) => a + r.cacheWrite, 0);
+      const output = rows.reduce((a, r) => a + r.output, 0);
+      const total = fresh + read;
+      const after = rows.slice(1);
+      return {
+        ratio: total > 0 ? read / total : 0,
+        retention: after.length ? after.reduce((a, r) => a + r.retention, 0) / after.length : 0,
+        fresh, read, write, output,
+      };
+    }
+
+    /** one request line: fresh / write / read / out + bars for BOTH ratio and retention */
+    function row(m: ReqMetrics) {
+      const mark = m.opensTurn ? ">" : "·";
       const colors = { ok: ink(ctx.theme, "ok"), warn: ink(ctx.theme, "warn"), err: ink(ctx.theme, "err") } as const;
       return (
         <text fg={colors[tone(m.retention)]}>
-          {`  ${String(m.index).padStart(4)}  ${where.padEnd(9)} ${fmtTokens(m.input).padStart(7)} ${fmtTokens(m.cacheWrite).padStart(7)} ${fmtTokens(m.cacheRead).padStart(7)}  ${fmtPercent(m.ratio).padStart(6)} ${ratioBar(m.retention)} ${fmtPercent(m.retention).padStart(6)}`}
+          {`  ${mark} ${String(m.index).padStart(3)} ${fmtTokens(m.input).padStart(6)} ${fmtTokens(m.cacheWrite).padStart(6)} ${fmtTokens(m.cacheRead).padStart(6)} ${fmtTokens(m.output).padStart(6)} ${fmtPercent(m.ratio).padStart(6)} ${bar(m.ratio, 1, 10)} ${fmtPercent(m.retention).padStart(6)} ${bar(m.retention, 1, 10)}`}
         </text>
       );
     }
+
+    /** per-turn aggregate on the SAME columns as row(), so every number lines up */
+    function turnHeader(rows: ReqMetrics[], n: number) {
+      const agg = turnAgg(rows);
+      const ret = rows.length > 1 ? fmtPercent(agg.retention).padStart(6) : "—".padStart(6);
+      const retBar = rows.length > 1 ? bar(agg.retention, 1, 10) : " ".repeat(10);
+      return (
+        <text fg={ink(ctx.theme, "muted")}>
+          {`  = ${`T${n}`.padStart(3)} ${fmtTokens(agg.fresh).padStart(6)} ${fmtTokens(agg.write).padStart(6)} ${fmtTokens(agg.read).padStart(6)} ${fmtTokens(agg.output).padStart(6)} ${fmtPercent(agg.ratio).padStart(6)} ${bar(agg.ratio, 1, 10)} ${ret} ${retBar} · ${rows.length} req`}
+        </text>
+      );
+    }
+
+    const MAX_ROWS = 30;
+    const short = (s: string, n = 140): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+    /** column header built with the same widths as row(), so labels sit over their columns */
+    const HEAD =
+      `    ${"#".padStart(3)} ${"fresh".padStart(6)} ${"write".padStart(6)} ` +
+      `${"read".padStart(6)} ${"out".padStart(6)} ${"ratio".padStart(6)} ${" ".repeat(10)} ${"reten".padStart(6)}`;
 
     async function showStats(sessionID: string) {
       const metrics = await getSessionMetrics(sessionID);
@@ -150,9 +202,16 @@ export default Plugin.define({
         return;
       }
 
-      const { list, totals, overallRatio, meanRatio, meanRetention, minRatio, maxRatio, saved, rewritten } = metrics;
+      const { list, totals, overallRatio, meanRetention, saved, rewritten } = metrics;
       const model = modelOf(sessionID);
       const lines = diagnose(metrics);
+      const state = stateOf(metrics);
+      const turns = groupTurns(list);
+      // single short diag line, never a paragraph
+      const diagHead = short(lines[0] ?? "", 140);
+      const worst = rewritten.worst[0];
+      const shownTurns = turns.slice(-12);
+      const hiddenReqs = list.length - shownTurns.reduce((a, t) => a + t.length, 0);
 
       log(
         `stats ${sessionID}: ${list.length} requests, ratio=${fmtPercent(overallRatio)}, retention=${fmtPercent(meanRetention)}`,
@@ -160,47 +219,57 @@ export default Plugin.define({
 
       ctx.ui.dialog.show(() => (
         <Dialog
-          title={`Cache Monitor — ${list.length} requests · ratio ${fmtPercent(overallRatio)} · retention ${fmtPercent(meanRetention)}`}
+          title={`cache · ${list.length} req · ${fmtPercent(overallRatio)} · ${fmtPercent(meanRetention)} · ${state.label}`}
           footer="esc close · ↑/↓ scroll"
         >
           <box flexDirection="column">
-            <text fg={ink(ctx.theme, "info")}><b>Summary</b></text>
-            <text fg={ink(ctx.theme, "text")}>{`  Session:          ${sessionID.slice(0, 28)}`}</text>
-            {model && <text fg={ink(ctx.theme, "muted")}>{`  Model:            ${model.providerID}/${model.id}`}</text>}
-            <text fg={ink(ctx.theme, "text")}>{`  Requests:         ${list.length}`}</text>
-            <text fg={ink(ctx.theme, tone(overallRatio))}>{`  Ratio (cached/share): ${ratioBar(overallRatio)} ${fmtPercent(overallRatio)}`}</text>
-            <text fg={ink(ctx.theme, tone(meanRetention))}>{`  Retention (reused/prev): ${ratioBar(meanRetention)} ${fmtPercent(meanRetention)}`}</text>
-            <text fg={ink(ctx.theme, "muted")}>{`  Ratio range:      ${fmtPercent(minRatio)} – ${fmtPercent(maxRatio)}`}</text>
-            <text fg={ink(ctx.theme, "muted")}>{`  Reuse after the first request: ${fmtPercent(meanRatio)} ratio`}</text>
-            <text> </text>
-
-            <text fg={ink(ctx.theme, "info")}><b>Tokens</b></text>
-            <text fg={ink(ctx.theme, "text")}>{`  Fresh input:      ${fmtTokens(totals.input).padEnd(9)} billed full price`}</text>
-            <text fg={ink(ctx.theme, "muted")}>{`  Cache write:      ${fmtTokens(totals.cacheWrite).padEnd(9)} what a rewritten prefix costs on the way in`}</text>
-            <text fg={ink(ctx.theme, "ok")}>{`  Cache read:       ${fmtTokens(totals.cacheRead).padEnd(9)} billed ~10%`}</text>
-            <text fg={ink(ctx.theme, "text")}>{`  Output:           ${fmtTokens(totals.output)}`}</text>
-            <text fg={ink(ctx.theme, "ok")}>{`  Saved ~${fmtTokens(saved)} token-equivalents`}</text>
-            <text> </text>
-
-            <text fg={ink(ctx.theme, "info")}><b>Reading the two numbers</b></text>
-            <text fg={ink(ctx.theme, "muted")}>{"  ratio      cacheRead / (cacheRead + fresh) of this prompt"}</text>
-            <text fg={ink(ctx.theme, "muted")}>{"             a big new tool result lowers it — that is not a lost cache"}</text>
-            <text fg={ink(ctx.theme, "muted")}>{"  retention  cacheRead / previous prompt: how much of what was already"}</text>
-            <text fg={ink(ctx.theme, "muted")}>{"             sent is still reused. 100% = the payload only appended."}</text>
-            <text> </text>
-
-            <text fg={ink(ctx.theme, "info")}><b>Diagnosis</b></text>
-            <For each={lines}>
-              {(l) => <text fg={ink(ctx.theme, l.startsWith("  #") ? "text" : "muted")}>{`  ${l}`}</text>}
-            </For>
-            {rewritten.count > 0 && (
-              <text fg={ink(ctx.theme, "warn")}>{`  ${rewritten.count} request(s) rewrote the prefix, ${fmtTokens(rewritten.fresh)} fresh tokens.`}</text>
+            {model && <text fg={ink(ctx.theme, "muted")}>{`  ${model.providerID}/${model.id}`}</text>}
+            <text fg={ink(ctx.theme, "info")}><b>Global</b></text>
+            <text fg={ink(ctx.theme, tone(overallRatio))}>{`  ratio  ${bar(overallRatio, 1, 20)} ${fmtPercent(overallRatio)}`}</text>
+            <text fg={ink(ctx.theme, tone(meanRetention))}>{`  reten  ${bar(meanRetention, 1, 20)} ${fmtPercent(meanRetention)}`}</text>
+            <text fg={ink(ctx.theme, "text")}>{`  in ${fmtTokens(totals.input)} · wr ${fmtTokens(totals.cacheWrite)} · rd ${fmtTokens(totals.cacheRead)} · out ${fmtTokens(totals.output)} · sv ~${fmtTokens(saved)}`}</text>
+            <text fg={ink(ctx.theme, state.kind)}>{`  ${state.label} — ${diagHead}`}</text>
+            {worst && (
+              <text fg={ink(ctx.theme, "muted")}>{`  worst #${worst.index} ${fmtPercent(worst.retention)} ret · ${fmtPercent(worst.ratio)} ratio`}</text>
             )}
-            <text> </text>
+            <text fg={ink(ctx.theme, "info")}><b>Turns · requests</b></text>
+            <text fg={ink(ctx.theme, "muted")}>{HEAD}</text>
+            {hiddenReqs > 0 && (
+              <text fg={ink(ctx.theme, "muted")}>{`  … ${hiddenReqs} older hidden`}</text>
+            )}
+            <For each={shownTurns}>
+              {(rows, ti) => (
+                <box flexDirection="column">
+                  <Show when={shownTurns.length > 1 || turns.length > 1}>
+                    {turnHeader(rows, turns.length - shownTurns.length + ti() + 1)}
+                  </Show>
+                  <For each={rows.slice(-MAX_ROWS)}>{(m) => row(m)}</For>
+                </box>
+              )}
+            </For>
+          </box>
+        </Dialog>
+      ));
+    }
 
-            <text fg={ink(ctx.theme, "info")}><b>Per request</b></text>
-            <text fg={ink(ctx.theme, "muted")}>{"     #  where        fresh   write    read   ratio  retention"}</text>
-            <For each={list}>{(m) => row(m)}</For>
+    async function showExplain(sessionID?: string) {
+      const metrics = sessionID ? await getSessionMetrics(sessionID) : null;
+      const ctxLine = metrics && metrics.list.length > 1
+        ? `  this session: ratio ${fmtPercent(metrics.overallRatio)} · retain ${fmtPercent(metrics.meanRetention)} over ${metrics.list.length} req`
+        : `  open a session and run /cache to see your numbers here`;
+      ctx.ui.dialog.show(() => (
+        <Dialog title="cache · ratio vs retention" footer="esc close · /cache for numbers">
+          <box flexDirection="column">
+            <text fg={ink(ctx.theme, "info")}><b>ratio = this prompt from cache</b></text>
+            <text fg={ink(ctx.theme, "muted")}>{"  cacheRead / (cacheRead + fresh)"}</text>
+            <text fg={ink(ctx.theme, "muted")}>{"  drops whenever new content arrives (big tool result) — normal"}</text>
+            <text> </text>
+            <text fg={ink(ctx.theme, "info")}><b>retention = prev prompt reused</b></text>
+            <text fg={ink(ctx.theme, "muted")}>{"  cacheRead / previous prompt"}</text>
+            <text fg={ink(ctx.theme, "muted")}>{"  100% = only appended · collapse = prefix rewritten, paid again"}</text>
+            <text> </text>
+            <text fg={ink(ctx.theme, "text")}>{ctxLine}</text>
+            <text fg={ink(ctx.theme, "muted")}>{"  low ratio + high retention = healthy tool loop, not a broken cache"}</text>
           </box>
         </Dialog>
       ));
@@ -218,27 +287,28 @@ export default Plugin.define({
       });
     }
 
-    // Widget for sidebar
+    // Sidebar: one metric per line, fixed columns.
+    //   cache · stable
+    //   session · 35 req
+    //     ratio ██████░░░░  55.0%
+    //     reten ██████████  99.9%
+    //   last #35
+    //     ratio ██████████  98.4%
+    //     reten ██████████  99.9%
+    const pct = (r: number): string => `${(r * 100).toFixed(1).padStart(5)}%`;
+    const BAR_W = 10;
     function Widget(props: { sessionID: string }) {
-      const [line, setLine] = createSignal<string | undefined>();
-      const [toneKind, setToneKind] = createSignal<"ok" | "warn" | "err" | "muted">("muted");
+      const [data, setData] = createSignal<SessionMetrics | null>(null);
+      const [failed, setFailed] = createSignal(false);
 
       const refresh = async () => {
         try {
           const metrics = await getSessionMetrics(props.sessionID);
-          if (!metrics || metrics.list.length === 0) {
-            setLine("cache · no data");
-            setToneKind("muted");
-            return;
-          }
-          const last = metrics.list[metrics.list.length - 1]!;
-          setLine(
-            `cache · ${fmtPercent(metrics.overallRatio)} ratio · ${fmtPercent(metrics.meanRetention)} retention · last ${fmtPercent(last.ratio)}`,
-          );
-          setToneKind(tone(metrics.meanRetention));
+          setFailed(false);
+          setData(metrics && metrics.list.length > 0 ? metrics : null);
         } catch {
-          setLine("cache · ?");
-          setToneKind("muted");
+          setFailed(true);
+          setData(null);
         }
       };
 
@@ -256,8 +326,30 @@ export default Plugin.define({
       });
 
       return (
-        <box flexDirection="row" gap={1}>
-          <text fg={ink(ctx.theme, toneKind())}>{line() ?? "cache · …"}</text>
+        <box flexDirection="column">
+          <Show
+            when={data()}
+            fallback={
+              <text fg={ink(ctx.theme, "muted")}>{failed() ? "cache · ?" : "cache · no data"}</text>
+            }
+          >
+            {(m: any) => {
+              const mm = m() as SessionMetrics;
+              const last = mm.list[mm.list.length - 1]!;
+              const st = stateOf(mm);
+              return (
+                <box flexDirection="column">
+                  <text fg={ink(ctx.theme, st.kind)}>{`cache · ${st.label}`}</text>
+                  <text fg={ink(ctx.theme, "muted")}>{`session · ${mm.list.length} req`}</text>
+                  <text fg={ink(ctx.theme, tone(mm.overallRatio))}>{`  ratio ${bar(mm.overallRatio, 1, BAR_W)} ${pct(mm.overallRatio)}`}</text>
+                  <text fg={ink(ctx.theme, tone(mm.meanRetention))}>{`  reten ${bar(mm.meanRetention, 1, BAR_W)} ${pct(mm.meanRetention)}`}</text>
+                  <text fg={ink(ctx.theme, "muted")}>{`last #${last.index}`}</text>
+                  <text fg={ink(ctx.theme, tone(last.ratio))}>{`  ratio ${bar(last.ratio, 1, BAR_W)} ${pct(last.ratio)}`}</text>
+                  <text fg={ink(ctx.theme, tone(last.retention))}>{`  reten ${bar(last.retention, 1, BAR_W)} ${pct(last.retention)}`}</text>
+                </box>
+              );
+            }}
+          </Show>
         </box>
       );
     }
@@ -277,6 +369,14 @@ export default Plugin.define({
               suggested: true,
               slash: { name: "cache", aliases: ["cache-monitor", "cm"] },
               run: () => void showMenu(),
+            },
+            {
+              id: "cache-monitor.explain",
+              title: "Cache Monitor: ratio vs retention, what's the difference?",
+              group: "cache-monitor",
+              palette: true,
+              slash: { name: "cache-why", aliases: ["cache-explain", "cache-help"] },
+              run: () => void showExplain(currentSession()),
             },
           ],
         }));
